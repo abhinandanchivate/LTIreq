@@ -129,6 +129,212 @@ graph TD
 ```
 
 ---
+Sure — let’s break down that **Mermaid graph step by step** to show how each element maps to real Azure networking components and how they interact.
+
+---
+
+## 🌐 Diagram Recap
+
+```mermaid
+graph TD
+    A[Address Space 10.0.0.0/16] --> B[Subnets]
+    B --> C[Web Subnet]
+    B --> D[App Subnet]
+    B --> E[DB Subnet]
+    E --> F[NSG + Route Tables]
+```
+
+---
+
+## 🧱 1. Address Space (A)
+
+### Concept:
+
+* The **Address Space** defines the entire **IP range** available within a **Virtual Network (VNET)**.
+* In this case, it’s **`10.0.0.0/16`**, which allows roughly **65,536 IP addresses** (from 10.0.0.0 to 10.0.255.255).
+* Think of this as the *total plot of land* you own — all subnets (plots) must fit inside it.
+
+### Azure Command Example:
+
+```bash
+az network vnet create \
+  --name vnet-main \
+  --address-prefix 10.0.0.0/16 \
+  --resource-group rg-network
+```
+
+### Best Practices:
+
+* Use **non-overlapping CIDR blocks** across environments (Dev, QA, Prod).
+* Keep space for **future subnets** or integration (e.g., VPN, ExpressRoute).
+
+---
+
+## 🏘️ 2. Subnets (B)
+
+### Concept:
+
+* **Subnets** are *divisions* of the main address space — like splitting your land into smaller plots.
+* Each subnet isolates resources logically and can apply unique security and routing rules.
+
+### Example:
+
+| Subnet Name | Address Prefix | Purpose                             |
+| ----------- | -------------- | ----------------------------------- |
+| web-subnet  | 10.0.1.0/24    | Web servers / Frontend              |
+| app-subnet  | 10.0.2.0/24    | Application layer (APIs, Functions) |
+| db-subnet   | 10.0.3.0/24    | Databases, caches, private storage  |
+
+### Command Example:
+
+```bash
+az network vnet subnet create \
+  --name web-subnet \
+  --address-prefix 10.0.1.0/24 \
+  --vnet-name vnet-main \
+  --resource-group rg-network
+```
+
+### Best Practices:
+
+* Use `/24` or larger blocks to prevent IP exhaustion.
+* Don’t place public and private workloads in the same subnet.
+
+---
+
+## 🌐 3. Web Subnet (C)
+
+### Purpose:
+
+* Hosts **frontend-facing services** like App Services, AKS Web Pods, or VMs behind a public load balancer.
+* Typically exposed through **Azure Front Door** or **Application Gateway (WAF)**.
+
+### Security:
+
+* NSG allows inbound HTTP/HTTPS (80/443) only from trusted public IPs or the gateway.
+* Outbound access may be restricted or routed through a firewall.
+
+---
+
+## ⚙️ 4. App Subnet (D)
+
+### Purpose:
+
+* Houses **internal applications**, APIs, or microservices that talk to both the Web and DB layers.
+* Usually accessed via **internal load balancers** — never exposed directly to the internet.
+
+### Security:
+
+* NSG allows traffic **only from Web Subnet (10.0.1.0/24)** on application ports (e.g., 8080, 5000).
+* Outbound traffic allowed only to **DB Subnet** or internal services.
+
+---
+
+## 🗄️ 5. DB Subnet (E)
+
+### Purpose:
+
+* Contains **data-layer resources** such as:
+
+  * Azure SQL with **Private Endpoint**
+  * Cosmos DB with **Private Link**
+  * Redis or Storage Accounts (VNET integrated)
+
+### Security:
+
+* Inbound only from **App Subnet**.
+* No internet access at all.
+* NSG rules enforce “deny all inbound” except specific application ports (1433, 6379, etc.).
+* Traffic often routed through **private DNS zones**.
+
+---
+
+## 🔒 6. NSG + Route Tables (F)
+
+### Network Security Group (NSG)
+
+Acts like a **firewall** for subnets or NICs:
+
+* Controls inbound/outbound traffic using rules.
+* Evaluated by **priority** (lower number = higher priority).
+
+**Example NSG Rules:**
+
+| Priority | Name      | Direction | Source     | Destination | Port  | Action |
+| -------- | --------- | --------- | ---------- | ----------- | ----- | ------ |
+| 100      | Allow-Web | Inbound   | Internet   | Web Subnet  | 443   | Allow  |
+| 200      | Allow-App | Inbound   | Web Subnet | App Subnet  | 8080  | Allow  |
+| 300      | Allow-DB  | Inbound   | App Subnet | DB Subnet   | 1433  | Allow  |
+| 4000     | Deny-All  | Inbound   | *Any*      | *Any*       | *Any* | Deny   |
+
+**Command Example:**
+
+```bash
+az network nsg rule create \
+  --nsg-name nsg-db \
+  --name allow-app-to-db \
+  --priority 300 \
+  --direction Inbound \
+  --source-address-prefixes 10.0.2.0/24 \
+  --destination-address-prefixes 10.0.3.0/24 \
+  --destination-port-ranges 1433 \
+  --access Allow
+```
+
+---
+
+### Route Table
+
+Defines **custom routing** for traffic control:
+
+* Useful for **forcing traffic through firewalls** or **ExpressRoute gateways**.
+* Applied at the **subnet level**.
+
+**Example:**
+
+| Destination CIDR | Next Hop Type           | Next Hop IP           |
+| ---------------- | ----------------------- | --------------------- |
+| 0.0.0.0/0        | Virtual Appliance       | 10.0.100.4 (Firewall) |
+| 192.168.0.0/16   | Virtual Network Gateway | —                     |
+
+**Command Example:**
+
+```bash
+az network route-table route create \
+  --route-table-name rt-db \
+  --name route-to-firewall \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address 10.0.100.4
+```
+
+---
+
+## 🧩 End-to-End Flow Summary
+
+| Step | Source      | Destination                   | Flow Description                       |
+| ---- | ----------- | ----------------------------- | -------------------------------------- |
+| 1    | Internet    | Web Subnet                    | Through Front Door / App Gateway       |
+| 2    | Web Subnet  | App Subnet                    | Via internal LB (port 8080/5000)       |
+| 3    | App Subnet  | DB Subnet                     | SQL or Redis protocol (private)        |
+| 4    | DB Subnet   | Firewall                      | Outbound internet restricted or routed |
+| 5    | All Subnets | Azure Monitor / Log Analytics | Flow logs, NSG diagnostics             |
+
+---
+
+## 🧠 Visual Analogy
+
+| Component         | Real-world Analogy                            |
+| ----------------- | --------------------------------------------- |
+| Address Space     | The entire gated community land               |
+| Subnets           | Individual zones (Residential, Office, Vault) |
+| NSG               | Security guards and access gates              |
+| Route Table       | Traffic signs and routing rules               |
+| Private Endpoints | Private back doors for internal deliveries    |
+
+---
+
+Would you like me to add a **second diagram** showing the **traffic flow (Internet → Web → App → DB → Firewall)** layered with NSG and routing enforcement visually in Mermaid? It would make the packet path crystal clear.
 
 # Slide 5: VNET Structure Example
 
